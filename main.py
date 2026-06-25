@@ -2,6 +2,7 @@ from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from database import engine, Base, get_db
 import models
+from sqlalchemy.sql import func
 # (Note: schemas name ki file hum aglay step mein use karenge, abhi aap raw dict ya fields soch sakte hain)
 
 app = FastAPI(title="Quantum Idempotent Fintech Ledger")
@@ -50,12 +51,56 @@ def create_transaction(
     description: str,
     db: Session = Depends(get_db)
 ):
-    #  APNI LOGIC IDHAR LIKHEIN:
-    # 1. Check idempotency: Kya yeh key already ledger_entries mein exist karti hai?
-    if create_transaction[idempotency_key]:
-        return 
-    # 2. Find Account: Account number se database se account ki ID nikaalein.
-    # 3. Calculate Balance: Is ID ki saari ledger entries ka SUM nikaalein.
-    # 4. Safety Check: Agar balance + amount < 0 ho raha hai, toh transaction block karein (Insufficient funds).
-    # 5. Insert: Sab sahi hai toh models.LedgerEntry insert karein aur db.commit() karein.
-    pass
+    # Step 1: Verify request idempotency to prevent double-charging or duplicate entries
+    existing_entry = db.query(models.LedgerEntry).filter(models.LedgerEntry.idempotency_key == idempotency_key).first()
+
+    if existing_entry:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Duplicate transaction request! This idempotency key has already been used."
+        )
+
+    # Step 2: Retrieve account with a pessimistic lock (FOR UPDATE) to block concurrent balance alterations
+    account = db.query(models.Account).filter(models.Account.account_number == account_number).with_for_update().first()
+
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Target financial account does not exist!"
+        )
+
+    # Step 3: Compute the current net balance by aggregating all historical ledger rows for this account
+    balance_result = db.query(func.sum(models.LedgerEntry.amount)).filter(models.LedgerEntry.account_id == account.id).scalar()
+    
+    # Fallback to 0.0 if no ledger entries exist yet (new account)
+    current_balance = float(balance_result) if balance_result is not None else 0.0
+    
+    # Step 4: Overdraft protection validation check
+    if current_balance + amount < 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Insufficient funds! Your current balance is {current_balance}, cannot execute transaction."
+        )
+
+    # Step 5: Construct and append the new financial record into the ledger stream
+    new_entry = models.LedgerEntry(
+        idempotency_key=idempotency_key,
+        account_id=account.id,
+        amount=amount,
+        description=description
+    )
+    
+    # Stage the ledger row insertion inside the transaction context
+    db.add(new_entry)
+    
+    # Commit the transaction block securely, releasing the database row lock
+    db.commit()
+    
+    # Refresh the tracking object instance to synchronize with live database states
+    db.refresh(new_entry)
+    
+    return {
+        "status": "Transaction executed successfully",
+        "transaction_id": new_entry.id,
+        "new_balance": float(current_balance + amount)
+    }
