@@ -104,3 +104,47 @@ def create_transaction(
         "transaction_id": new_entry.id,
         "new_balance": float(current_balance + amount)
     }
+
+
+@app.get("/accounts/{account_number}/balance")
+def get_balance(account_number: str, db: Session = Depends(get_db)):
+    # 1. Fetch the account from the database using the account_number string
+    account = db.query(models.Account).filter(models.Account.account_number == account_number).first()
+    
+    # 2. Add validation: If account does not exist, raise a 404 HTTPException
+    if not account:
+        # WRITE YOUR CODE HERE
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account Not Found"
+        )
+
+    # 3. Aggregate the sum of all transaction amounts for this account ID
+    balance_result = db.query(func.sum(models.LedgerEntry.amount)).filter(models.LedgerEntry.account_id == account.id).scalar()
+    
+    # 4. Handle fallback: Convert Decimal to float, and default to 0.0 if balance_result is None
+    # WRITE YOUR CODE HERE
+    current_balance = float(balance_result) if balance_result is  not None else 0.0
+    
+    # 5. Return the clean balance data
+    return {
+        "account_number": account_number,
+        "owner_name": account.owner_name,
+        "current_balance": current_balance
+    }
+
+
+@app.get("/accounts/{account_number}/statement")
+def get_statement(account_number: str, db: Session = Depends(get_db)):
+    # 1. Validate Account existence
+    account = db.query(models.Account).filter(models.Account.account_number == account_number).first()
+    if not account:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Account not found")
+        
+    # 2. Fetch history records sorted from newest to oldest
+    history = db.query(models.LedgerEntry).filter(models.LedgerEntry.account_id == account.id).order_by(models.LedgerEntry.created_at.desc()).all()
+    
+    return {
+        "account_number": account_number,
+        "history": history
+    }
